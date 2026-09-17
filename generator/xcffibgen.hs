@@ -22,6 +22,49 @@ import Options.Applicative
 import System.Directory
 import System.FilePath
 
+import Data.Char (isAlphaNum, isHexDigit)
+import Data.List (sort, stripPrefix)
+import Data.Maybe (fromMaybe, mapMaybe)
+import System.Environment (lookupEnv)
+import System.Process (readProcess)
+
+keysymSections :: [String]
+keysymSections =
+  [ "MISCELLANY", "XKB_KEYS", "3270", "LATIN1", "LATIN2", "LATIN3"
+  , "LATIN4", "LATIN8", "LATIN9", "KATAKANA", "ARABIC", "CYRILLIC"
+  , "GREEK", "TECHNICAL", "SPECIAL", "PUBLISHING", "APL", "HEBREW"
+  , "THAI", "KOREAN", "ARMENIAN", "GEORGIAN", "CAUCASUS", "VIETNAMESE"
+  , "CURRENCY", "MATHEMATICAL", "BRAILLE", "SINHALA"
+  ]
+
+generateKeysym :: FilePath -> IO ()
+generateKeysym out = do
+  cpp <- fromMaybe "cpp" <$> lookupEnv "CPP"
+  contents <- readProcess cpp args ""
+  writeFile out $ unlines $ sort $ mapMaybe parseDefine (lines contents)
+  where
+    args = ["-dM"] ++ map ("-DXK_" ++) keysymSections ++
+           ["-include", "X11/keysymdef.h", "-include", "X11/XF86keysym.h", "-"]
+
+    parseDefine line = case words line of
+      ("#define" : name@('X' : 'K' : '_' : suffix) : val : _)
+        | validName suffix
+        , suffix `notElem` keysymSections -> parseValue name val
+      ("#define" : name@('X' : 'F' : '8' : '6' : 'X' : 'K' : '_' : suffix) : val : _)
+        | validName suffix -> parseValue name val
+      _ -> Nothing
+
+    validName suffix = not (null suffix) && all (\c -> isAlphaNum c || c == '_') suffix
+
+    parseValue name val = case val of
+      '0' : 'x' : digits
+        | not (null digits) && all isHexDigit digits -> Just $ name ++ " = " ++ val
+      _ -> case stripPrefix "_EVDEVK(0x" val >>= (fmap reverse . stripPrefix ")" . reverse) of
+        Just digits
+          | not (null digits) && all isHexDigit digits ->
+              Just $ name ++ " = 0x10081000 + 0x" ++ digits
+        _ -> error $ "invalid keysym value: " ++ name ++ " " ++ val
+
 data Xcffibgen = Xcffibgen { input :: String
                            , output :: String
                            }
@@ -42,6 +85,7 @@ run (Xcffibgen inp out) = do
   headers <- parseXHeaders inp
   createDirectoryIfMissing True out
   sequence_ $ map processFile $ xform headers
+  generateKeysym $ out </> "keysymdef.py"
   where
     processFile (fname, suite) = do
       putStrLn fname
