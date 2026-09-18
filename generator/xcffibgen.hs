@@ -22,8 +22,9 @@ import Options.Applicative
 import System.Directory
 import System.FilePath
 
+import Control.Monad (mfilter)
 import Data.Char (isAlphaNum, isHexDigit)
-import Data.List (sort, stripPrefix)
+import Data.List (isPrefixOf, sort, stripPrefix)
 import Data.Maybe (fromMaybe, mapMaybe)
 import System.Environment (lookupEnv)
 import System.Process (readProcess)
@@ -37,33 +38,35 @@ keysymSections =
   , "CURRENCY", "MATHEMATICAL", "BRAILLE", "SINHALA"
   ]
 
-generateKeysym :: FilePath -> IO ()
-generateKeysym out = do
+generateKeysyms :: FilePath -> IO ()
+generateKeysyms out = do
   cpp <- fromMaybe "cpp" <$> lookupEnv "CPP"
-  contents <- readProcess cpp args ""
-  writeFile out $ unlines $ sort $ mapMaybe parseDefine (lines contents)
+  let generate outputName headerFile extraArgs shouldKeep = do
+        defines <- lines <$> readProcess cpp
+          (["-dM"] ++ extraArgs ++ ["-include", headerFile, "-"]) ""
+        writeFile (out </> outputName) . unlines . sort $
+          mapMaybe (fmap formatDefine . mfilter (shouldKeep . fst) . parseDefine) defines
+  generate "keysymdef.py" "X11/keysymdef.h" (map ("-DXK_" ++) keysymSections) $
+    maybe False (`notElem` keysymSections) . stripPrefix "XK_"
+  generate "xf86keysym.py" "X11/XF86keysym.h" [] $ isPrefixOf "XF86XK_"
   where
-    args = ["-dM"] ++ map ("-DXK_" ++) keysymSections ++
-           ["-include", "X11/keysymdef.h", "-include", "X11/XF86keysym.h", "-"]
-
     parseDefine line = case words line of
-      ("#define" : name@('X' : 'K' : '_' : suffix) : val : _)
-        | validName suffix
-        , suffix `notElem` keysymSections -> parseValue name val
-      ("#define" : name@('X' : 'F' : '8' : '6' : 'X' : 'K' : '_' : suffix) : val : _)
-        | validName suffix -> parseValue name val
+      ("#define" : name : vals)
+        | validName name -> Just (name, unwords vals)
       _ -> Nothing
 
-    validName suffix = not (null suffix) && all (\c -> isAlphaNum c || c == '_') suffix
+    validName name = not (null name) && all (\c -> isAlphaNum c || c == '_') name
 
-    parseValue name val = case val of
+    formatDefine (name, val) = name ++ " = " ++ renderValue val
+
+    renderValue val = case val of
       '0' : 'x' : digits
-        | not (null digits) && all isHexDigit digits -> Just $ name ++ " = " ++ val
+        | not (null digits) && all isHexDigit digits -> val
       _ -> case stripPrefix "_EVDEVK(0x" val >>= (fmap reverse . stripPrefix ")" . reverse) of
         Just digits
           | not (null digits) && all isHexDigit digits ->
-              Just $ name ++ " = 0x10081000 + 0x" ++ digits
-        _ -> error $ "invalid keysym value: " ++ name ++ " " ++ val
+              "0x10081000 + 0x" ++ digits
+        _ -> error $ "invalid keysym value: " ++ val
 
 data Xcffibgen = Xcffibgen { input :: String
                            , output :: String
@@ -85,7 +88,7 @@ run (Xcffibgen inp out) = do
   headers <- parseXHeaders inp
   createDirectoryIfMissing True out
   sequence_ $ map processFile $ xform headers
-  generateKeysym $ out </> "keysymdef.py"
+  generateKeysyms out
   where
     processFile (fname, suite) = do
       putStrLn fname
